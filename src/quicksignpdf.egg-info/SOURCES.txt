@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+src/quicksignpdf/__init__.py
+src/quicksignpdf/app.py
+src/quicksignpdf.egg-info/PKG-INFO
+src/quicksignpdf.egg-info/SOURCES.txt
+src/quicksignpdf.egg-info/dependency_links.txt
+src/quicksignpdf.egg-info/entry_points.txt
+src/quicksignpdf.egg-info/requires.txt
+src/quicksignpdf.egg-info/top_level.txt

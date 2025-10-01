@@ -1,0 +1,2 @@
+[console_scripts]
+quicksign-pdf = quicksignpdf.app:main
