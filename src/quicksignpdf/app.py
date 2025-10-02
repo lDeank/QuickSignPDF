@@ -7,37 +7,33 @@ from collections import deque
 import fitz  # PyMuPDF
 
 from PySide6.QtCore import (
-    Qt, QRectF, QRect, QPointF, QSize, QElapsedTimer, QEvent
+    Qt, QRectF, QRect, QPointF, QSize, QElapsedTimer, QEvent, QTimer
 )
 from PySide6.QtGui import (
     QAction, QImage, QPainter, QPen, QPixmap, QColor, QTabletEvent,
-    QKeySequence, QShortcut, QIcon
+    QKeySequence, QShortcut, QIcon, QFont, QFontMetrics
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
     QPushButton, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
-    QSizePolicy, QDialog
+    QSizePolicy, QDialog, QCheckBox
 )
 
 # ---------------------------------------------------------------------
 # Carga de recursos del paquete (iconos, etc.)
 # ---------------------------------------------------------------------
 try:
-    # Python 3.9+: importlib.resources.files
     from importlib.resources import files as pkg_files
     def pkg_asset(rel_path: str) -> str:
-        # ejemplo: pkg_asset("assets/icon.ico")
         return str(pkg_files("quicksignpdf").joinpath(rel_path))
 except Exception:
-    # Fallback: relativo al cwd del repo
     def pkg_asset(rel_path: str) -> str:
         return os.path.join(os.path.abspath("."), "src", "quicksignpdf", rel_path)
 
 # ---------------------------------------------------------------------
-# Recortar imagen por la bounding box de alfa (firma pequeña se adapta)
+# Recorte por alfa (para que la firma se adapte limpio al rectángulo)
 # ---------------------------------------------------------------------
 def crop_alpha_bbox(qimg: QImage, padding: int = 16) -> QImage:
-    """Recorta el QImage a la caja mínima que contiene píxeles con alfa>0."""
     w, h = qimg.width(), qimg.height()
     minx, miny, maxx, maxy = w, h, -1, -1
     for y in range(h):
@@ -48,16 +44,83 @@ def crop_alpha_bbox(qimg: QImage, padding: int = 16) -> QImage:
                 if x > maxx: maxx = x
                 if y > maxy: maxy = y
     if maxx < 0:
-        # Imagen totalmente transparente (nada dibujado)
         return qimg
-
     minx = max(0, minx - padding)
     miny = max(0, miny - padding)
     maxx = min(w - 1, maxx + padding)
     maxy = min(h - 1, maxy + padding)
-
     rect = QRect(minx, miny, maxx - minx + 1, maxy - miny + 1)
     return qimg.copy(rect)
+
+# ---------------------------------------------------------------------
+# Sello grande “Confirmado” (esquina inferior izquierda), preservando alfa
+# ---------------------------------------------------------------------
+def add_confirmation_stamp(
+    img: QImage,
+    title_text: str = "Confirmado",
+    dt_text: str = "",
+    box_width_frac: float = 0.45,  # ancho del recuadro ~45% del ancho de la firma
+    margin: int = 24,              # margen desde el borde de la imagen
+    pad_in: int = 16               # padding interno del recuadro
+) -> QImage:
+    if img.isNull():
+        return img
+
+    W, H = img.width(), img.height()
+    max_box_w = max(160, int(W * box_width_frac))
+
+    # Tamaños de fuente proporcionales (grandes)
+    title_pt = max(14, int(H * 0.065))  # ~6.5% de la altura
+    dt_pt    = max(12, int(H * 0.055))  # ~5.5%
+
+    out = QImage(img.size(), QImage.Format.Format_ARGB32_Premultiplied)
+    out.fill(Qt.GlobalColor.transparent)
+
+    p = QPainter(out)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    p.drawImage(0, 0, img)
+
+    f_title = QFont(); f_title.setPointSize(title_pt); f_title.setBold(True)
+    f_dt    = QFont(); f_dt.setPointSize(dt_pt)
+    fm_t = QFontMetrics(f_title); fm_d = QFontMetrics(f_dt)
+
+    def fits():
+        return (fm_t.horizontalAdvance(title_text) <= max_box_w - 2*pad_in
+                and fm_d.horizontalAdvance(dt_text) <= max_box_w - 2*pad_in)
+
+    attempts = 0
+    while not fits() and attempts < 40:
+        title_pt = max(10, title_pt - 1)
+        dt_pt    = max(10, dt_pt - 1)
+        f_title.setPointSize(title_pt); f_dt.setPointSize(dt_pt)
+        fm_t = QFontMetrics(f_title); fm_d = QFontMetrics(f_dt)
+        attempts += 1
+
+    line_gap = max(6, int(H * 0.01))
+    box_w = min(max_box_w, max(fm_t.horizontalAdvance(title_text), fm_d.horizontalAdvance(dt_text)) + 2*pad_in)
+    box_h = fm_t.height() + line_gap + fm_d.height() + 2*pad_in
+
+    # Posición: inferior izquierda
+    x = margin
+    y = H - box_h - margin
+    rect = QRectF(x, y, box_w, box_h)
+
+    # Fondo semitransparente + borde suave
+    p.fillRect(rect, QColor(255, 255, 255, 200))
+    p.setPen(QPen(QColor(0, 0, 0, 90), 1))
+    p.drawRect(rect)
+
+    # Textos
+    p.setPen(QPen(QColor(0, 0, 0)))
+    p.setFont(f_title)
+    p.drawText(QRectF(x + pad_in, y + pad_in, box_w - 2*pad_in, fm_t.height()),
+               Qt.AlignLeft | Qt.AlignVCenter, title_text)
+    p.setFont(f_dt)
+    p.drawText(QRectF(x + pad_in, y + pad_in + fm_t.height() + line_gap, box_w - 2*pad_in, fm_d.height()),
+               Qt.AlignLeft | Qt.AlignVCenter, dt_text)
+
+    p.end()
+    return out
 
 # ---------------------------------------------------------------------
 # Inserción de firma (PNG bytes) en PDF
@@ -69,30 +132,22 @@ def insert_signature_png(pdf_path, page_index, rect_pt, png_bytes):
     rect = fitz.Rect(*rect_pt)
     page.insert_image(rect, stream=png_bytes, keep_proportion=True, overlay=True)
 
-    base, ext = os.path.splitext(pdf_path)
+    base, _ = os.path.splitext(pdf_path)
     out = f"{base}_firmado.pdf"
     if os.path.exists(out):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out = f"{base}_firmado_{ts}.pdf"
 
-    # Deflate + garbage para PDFs más limpios
     doc.save(out, deflate=True, garbage=4)
     doc.close()
     return out
 
 # ---------------------------------------------------------------------
-# Canvas de firma con suavizado + Catmull–Rom
+# Canvas de firma (buffer = widget, transparente, Catmull–Rom)
 # ---------------------------------------------------------------------
 class SignatureCanvas(QWidget):
-    """
-    Anti-jitter:
-    - Exponential smoothing (One-Euro aprox) + promedio móvil (ventana 8).
-    - Spline Catmull–Rom con alta subdivisión.
-    - Sin líneas fantasma; sólo pinta con presión/botón reales.
-    """
     def __init__(self, size_px=QSize(2000, 900), pen_width=7, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(900, 300)
         self.setMouseTracking(True)
         self.setAttribute(Qt.WidgetAttribute.WA_TabletTracking, True)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -100,38 +155,40 @@ class SignatureCanvas(QWidget):
         self.pen_width = pen_width
         self.pen_color = QColor(0, 0, 0)
 
-        # Umbrales
         self.min_start_dist = 6
         self.min_seg_len = max(1.2 * pen_width, 6)
         self.press_threshold = 0.10
         self._pressed = False
 
-        # Buffer de dibujo
         self._img = QImage(size_px, QImage.Format.Format_ARGB32_Premultiplied)
-        self._img.fill(Qt.GlobalColor.transparent)
+        self._img.fill(Qt.GlobalColor.transparent)  # TRANSPARENTE
 
-        # Estado del trazo
         self._points = []
         self._raw_prev = None
-        the_smooth_prev = None
-        self._smooth_prev = the_smooth_prev
+        self._smooth_prev = None
 
-        # Exponential smoothing
         self._timer = QElapsedTimer(); self._timer.start()
         self._last_ms = self._timer.elapsed()
         self.smin = 0.14
         self.smax = 0.65
         self.vref = 2.8
 
-        # Promedio móvil corto
         self._ma_win = deque(maxlen=8)
-
-        pal = self.palette()
-        pal.setColor(self.backgroundRole(), Qt.GlobalColor.white)
-        self.setPalette(pal); self.setAutoFillBackground(True)
 
     def image(self) -> QImage:
         return self._img
+
+    def set_buffer_size(self, size_px: QSize, preserve: bool = True):
+        if size_px == self._img.size():
+            return
+        new_img = QImage(size_px, QImage.Format.Format_ARGB32_Premultiplied)
+        new_img.fill(Qt.GlobalColor.transparent)
+        if preserve and not self._img.isNull():
+            p = QPainter(new_img)
+            p.drawImage(0, 0, self._img)
+            p.end()
+        self._img = new_img
+        self.update()
 
     # ---- Suavizado ----
     def _alpha_for(self, v):
@@ -160,38 +217,24 @@ class SignatureCanvas(QWidget):
         sy = sum(y for _, y in self._ma_win) / n
         return QPointF(sx, sy)
 
-    # ---- Catmull–Rom ----
     @staticmethod
     def _catmull(p0, p1, p2, p3, t):
-        t2, t3 = t * t, t * t * t
-        x = 0.5 * (
-            (2 * p1.x()) + (-p0.x() + p2.x()) * t +
-            (2 * p0.x() - 5 * p1.x() + 4 * p2.x() - p3.x()) * t2 +
-            (-p0.x() + 3 * p1.x() - 3 * p2.x() + p3.x()) * t3
-        )
-        y = 0.5 * (
-            (2 * p1.y()) + (-p0.y() + p2.y()) * t +
-            (2 * p0.y() - 5 * p1.y() + 4 * p2.y() - p3.y()) * t2 +
-            (-p0.y() + 3 * p1.y() - 3 * p2.y() + p3.y()) * t3
-        )
+        t2, t3 = t*t, t*t*t
+        x = 0.5*((2*p1.x()) + (-p0.x()+p2.x())*t + (2*p0.x()-5*p1.x()+4*p2.x()-p3.x())*t2 +
+                 (-p0.x()+3*p1.x()-3*p2.x()+p3.x())*t3)
+        y = 0.5*((2*p1.y()) + (-p0.y()+p2.y())*t + (2*p0.y()-5*p1.y()+4*p2.y()-p3.y())*t2 +
+                 (-p0.y()+3*p1.y()-3*p2.y()+p3.y())*t3)
         return QPointF(x, y)
 
     def _draw_spline_segment(self, p0, p1, p2, p3):
-        x_off = (self.width() - self._img.width()) / 2
-        y_off = (self.height() - self._img.height()) / 2
-
-        def to_buf(q): return QPointF(q.x() - x_off, q.y() - y_off)
-        p0b, p1b, p2b, p3b = map(to_buf, (p0, p1, p2, p3))
-
+        p0b, p1b, p2b, p3b = p0, p1, p2, p3
         approx_len = (p2b - p1b).manhattanLength()
-        steps = max(16, int(approx_len / 0.8))  # densidad alta
+        steps = max(16, int(approx_len / 0.8))
 
         painter = QPainter(self._img)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        pen = QPen(
-            self.pen_color, self.pen_width,
-            Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin
-        )
+        pen = QPen(self.pen_color, self.pen_width,
+                   Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
         painter.setPen(pen)
         prev = self._catmull(p0b, p1b, p2b, p3b, 0.0)
         for i in range(1, steps + 1):
@@ -202,16 +245,18 @@ class SignatureCanvas(QWidget):
         painter.end()
         self.update()
 
-    # ---- Pintado ----
     def paintEvent(self, e):
         p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        pm = QPixmap.fromImage(self._img)
-        x = (self.width() - pm.width()) // 2
-        y = (self.height() - pm.height()) // 2
-        p.drawPixmap(x, y, pm)
+        p.drawImage(0, 0, self._img)
 
     def resizeEvent(self, e):
-        super().resizeEvent(e); self.update()
+        super().resizeEvent(e)
+        self.set_buffer_size(self.size(), preserve=True)
+        self.update()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self.set_buffer_size(self.size(), preserve=True)
 
     # ---- Flujo de trazo ----
     def _stroke_begin(self, pos_w: QPointF):
@@ -220,28 +265,17 @@ class SignatureCanvas(QWidget):
         self._ma_win.clear()
 
     def _stroke_add(self, pos_w: QPointF):
-        s = self._ema(pos_w)
-        s = self._moving_avg(s)
-
+        s = self._ema(pos_w); s = self._moving_avg(s)
         if len(self._points) == 1:
             if (s - self._points[0]).manhattanLength() < self.min_seg_len:
                 return
             self._points.append(s)
-            # primer segmento lineal
-            x_off = (self.width() - self._img.width()) / 2
-            y_off = (self.height() - self._img.height()) / 2
             a, b = self._points[0], self._points[1]
-            a = QPointF(a.x() - x_off, a.y() - y_off)
-            b = QPointF(b.x() - x_off, b.y() - y_off)
             painter = QPainter(self._img)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            pen = QPen(
-                self.pen_color, self.pen_width,
-                Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin
-            )
-            painter.setPen(pen); painter.drawLine(a, b); painter.end(); self.update()
-            return
-
+            pen = QPen(self.pen_color, self.pen_width,
+                       Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen); painter.drawLine(a, b); painter.end(); self.update(); return
         self._points.append(s)
         if len(self._points) >= 4:
             p0, p1, p2, p3 = self._points[-4], self._points[-3], self._points[-2], self._points[-1]
@@ -252,13 +286,11 @@ class SignatureCanvas(QWidget):
         self._raw_prev = None; self._smooth_prev = None
         self._ma_win.clear()
 
-    # ---- Pluma / Mouse ----
     def tabletEvent(self, ev: QTabletEvent):
         t = ev.type(); pos = ev.position()
         pressure = ev.pressure() if hasattr(ev, "pressure") else 0.0
         down = self._pressed or (pressure is not None and pressure > self.press_threshold) \
                or bool(ev.buttons() & Qt.MouseButton.LeftButton)
-
         if t == QTabletEvent.Type.TabletPress:
             self._pressed = True; self._stroke_begin(pos); ev.accept(); return
         if t == QTabletEvent.Type.TabletMove:
@@ -284,30 +316,41 @@ class SignatureCanvas(QWidget):
             self._stroke_end()
 
     def clear(self):
-        self._img.fill(Qt.GlobalColor.transparent); self.update()
+        self._img.fill(Qt.GlobalColor.transparent)
+        self.update()
 
 # ---------------------------------------------------------------------
-# Diálogo de firma (modal + fullscreen) con recorte por alfa en accept()
+# Pad FULLSCREEN (frameless) + toolbar flotante (botones)
 # ---------------------------------------------------------------------
 class SignaturePad(QDialog):
     def __init__(self, size_px=QSize(2000, 900), pen_width=7, parent=None, fullscreen=True):
         super().__init__(parent)
-        self.setWindowTitle("Firmar")
-        self.setModal(True)
+
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.setModal(True)
 
-        # Lienzo
+        # Lienzo ocupa todo
         self.canvas = SignatureCanvas(size_px=size_px, pen_width=pen_width, parent=self)
+        lay = QVBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(0)
+        lay.addWidget(self.canvas, 1)
 
-        # UI
-        btn_clear = QPushButton("Limpiar"); btn_cancel = QPushButton("Cancelar")
-        btn_ok = QPushButton("Confirmar"); btn_ok.setDefault(True)
-
-        row = QHBoxLayout(); row.setContentsMargins(16, 8, 16, 16)
-        row.addWidget(btn_clear); row.addStretch(); row.addWidget(btn_cancel); row.addWidget(btn_ok)
-
-        lay = QVBoxLayout(self); lay.setContentsMargins(16, 16, 16, 8)
-        lay.addWidget(self.canvas, 1); lay.addLayout(row)
+        # Toolbar flotante
+        self.toolbar = QFrame(self); self.toolbar.setObjectName("PadToolbar")
+        self.toolbar.setMinimumSize(320, 56)
+        self.toolbar.setStyleSheet("""
+            #PadToolbar { background: rgba(0,0,0,90); border-radius: 12px; }
+            #PadToolbar QPushButton {
+                padding: 8px 14px; border-radius: 8px;
+                background: #ffffff; color: #000; border: 1px solid rgba(0,0,0,0.2);
+            }
+            #PadToolbar QPushButton:hover { background: #f0f0f0; }
+        """)
+        tb = QHBoxLayout(self.toolbar); tb.setContentsMargins(10,10,10,10); tb.setSpacing(8)
+        btn_clear  = QPushButton("Limpiar",  self.toolbar)
+        btn_cancel = QPushButton("Cancelar", self.toolbar)
+        btn_ok     = QPushButton("Confirmar", self.toolbar); btn_ok.setDefault(True)
+        tb.addWidget(btn_clear); tb.addStretch(); tb.addWidget(btn_cancel); tb.addWidget(btn_ok)
 
         btn_clear.clicked.connect(self.canvas.clear)
         btn_cancel.clicked.connect(self.reject)
@@ -316,41 +359,51 @@ class SignaturePad(QDialog):
         # Atajos
         QShortcut(QKeySequence("Escape"), self, activated=self.reject)
         QShortcut(QKeySequence("Return"), self, activated=self.accept)
-        QShortcut(QKeySequence("Enter"), self, activated=self.accept)
-
-        # F11 toggle fullscreen
-        def toggle_full():
-            if self.windowState() & Qt.WindowState.WindowFullScreen:
-                self.setWindowState(Qt.WindowState.WindowNoState)
-                self.showMaximized()
-            else:
-                self.setWindowState(Qt.WindowState.WindowFullScreen)
-        QShortcut(QKeySequence("F11"), self, activated=toggle_full)
+        QShortcut(QKeySequence("Enter"),  self, activated=self.accept)
+        QShortcut(QKeySequence("Ctrl+L"), self, activated=self.canvas.clear)
+        QShortcut(QKeySequence("F11"),    self, activated=self._toggle_full)
 
         self._want_fullscreen = bool(fullscreen)
         self._shown_once = False
 
-        if not self._want_fullscreen:
-            self.resize(1200, 700)
-            self.showMaximized()
-
-        pal = self.palette()
-        pal.setColor(self.backgroundRole(), Qt.GlobalColor.white)
+        pal = self.palette(); pal.setColor(self.backgroundRole(), Qt.GlobalColor.white)
         self.setPalette(pal); self.setAutoFillBackground(True)
 
         self._png_bytes = None
+
+    def _toggle_full(self):
+        if self.windowState() & Qt.WindowState.WindowFullScreen:
+            self.showNormal(); self.showMaximized()
+        else:
+            self.showFullScreen()
 
     def showEvent(self, ev: QEvent):
         super().showEvent(ev)
         if not self._shown_once:
             self._shown_once = True
             if self._want_fullscreen:
-                self.setWindowState(Qt.WindowState.WindowFullScreen)
+                self.showFullScreen()
+        QTimer.singleShot(0, lambda: self.canvas.set_buffer_size(self.canvas.size(), preserve=True))
+        QTimer.singleShot(0, self._position_toolbar)
+        QTimer.singleShot(0, self.toolbar.show)  # asegurar visibilidad
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._position_toolbar()
+
+    def _position_toolbar(self):
+        pad = 16
+        hint = self.toolbar.sizeHint()
+        w = max(320, min(hint.width(), self.width() - 2*pad))
+        h = max(56, hint.height())
+        x = self.width()  - w - pad
+        y = self.height() - h - pad
+        self.toolbar.setGeometry(x, y, w, h)
+        self.toolbar.raise_()
 
     def result_png_bytes(self): return self._png_bytes
 
     def accept(self):
-        # Guardar la imagen recortada por alfa (para que escale bien al rectángulo)
         from PySide6.QtCore import QBuffer, QByteArray
         qimg = crop_alpha_bbox(self.canvas.image(), padding=16)
         qba = QByteArray(); buf = QBuffer(qba); buf.open(QBuffer.OpenModeFlag.WriteOnly)
@@ -363,7 +416,7 @@ class SignaturePad(QDialog):
         super().reject()
 
 # ---------------------------------------------------------------------
-# Visor PDF con selección + preview de firma editable (mover/resize/zoom)
+# Visor PDF con selección + preview editable (mover/resize/zoom)
 # ---------------------------------------------------------------------
 class PdfViewer(QWidget):
     def __init__(self, parent=None):
@@ -388,7 +441,11 @@ class PdfViewer(QWidget):
         top.addStretch(); top.addWidget(self.btn_prev); top.addWidget(self.btn_next)
         top.addStretch(); top.addWidget(self.btn_sign)
 
-        # Botones de preview edición
+        # Checkbox: Fecha y hora en la firma
+        self.chk_ts = QCheckBox("Fecha y hora")
+        self.chk_ts.setChecked(True)
+        top.addWidget(self.chk_ts)
+
         self.btn_apply = QPushButton("Aplicar")
         self.btn_cancel = QPushButton("Cancelar")
         self.btn_apply.setVisible(False); self.btn_cancel.setVisible(False)
@@ -396,34 +453,28 @@ class PdfViewer(QWidget):
 
         lay = QVBoxLayout(self); lay.addLayout(top); lay.addWidget(self.canvas)
 
-        # Selección
         self.sel_start = None; self.sel_rect = None
         self.canvas.mousePressEvent = self._start_sel
         self.canvas.mouseMoveEvent = self._drag_sel
         self.canvas.mouseReleaseEvent = self._end_sel
 
-        # Navegación / acción
         self.btn_prev.clicked.connect(self.prev_page)
         self.btn_next.clicked.connect(self.next_page)
         self.btn_sign.clicked.connect(self.sign_here)
-
-        # Preview edición
         self.btn_apply.clicked.connect(self.apply_signature)
         self.btn_cancel.clicked.connect(self.cancel_signature)
 
         self._page_pix = None; self._page_pt_size = (1, 1)
         self._preview_active = False
-        self._preview_img = None    # QImage
-        self._preview_rect = None   # QRectF en coords de canvas
+        self._preview_img = None
+        self._preview_rect = None
         self._dragging = False
         self._resizing = None
         self._drag_start = None
         self._orig_rect = None
 
-        # Capturar rueda en modo preview
         self.canvas.wheelEvent = self._wheel_event
 
-    # ---- PDF I/O ----
     def open_pdf(self, path):
         try:
             if self.doc: self.doc.close()
@@ -450,7 +501,6 @@ class PdfViewer(QWidget):
         self._page_pix = QPixmap.fromImage(img.copy())
         self._draw_canvas(); self.lbl_page.setText(f"{self.page_index+1}/{len(self.doc)}")
         self.sel_rect = None
-        # Si cambias de página, cancela preview
         self.cancel_signature()
 
     def _draw_canvas(self):
@@ -463,34 +513,25 @@ class PdfViewer(QWidget):
         if self._page_pix:
             p.drawPixmap(x_off, y_off, self._page_pix)
 
-        # Selección normal (rect dorado) si no hay preview
         if self.sel_rect and not self.sel_rect.isEmpty() and not self._preview_active:
             pen = QPen(QColor(255, 215, 0), 3); p.setPen(pen)
             pix_rect = QRectF(x_off, y_off, self.pm_size.width(), self.pm_size.height())
             r = self.sel_rect.intersected(pix_rect); p.drawRect(r)
 
-        # Preview de firma (contain + handles)
         if self._preview_active and self._preview_img is not None and self._preview_rect is not None:
             r = QRectF(self._preview_rect)
-            img_w = self._preview_img.width()
-            img_h = self._preview_img.height()
+            img_w = self._preview_img.width(); img_h = self._preview_img.height()
             if img_w > 0 and img_h > 0:
-                sx = r.width() / img_w
-                sy = r.height() / img_h
-                scale = min(sx, sy)  # contain
-                draw_w = img_w * scale
-                draw_h = img_h * scale
+                sx = r.width() / img_w; sy = r.height() / img_h
+                scale = min(sx, sy)
+                draw_w = img_w * scale; draw_h = img_h * scale
                 draw_x = r.x() + (r.width() - draw_w) / 2.0
                 draw_y = r.y() + (r.height() - draw_h) / 2.0
 
-                # Caja de edición
                 pen_box = QPen(QColor(255, 215, 0, 220), 2)
                 p.setPen(pen_box); p.drawRect(r)
-
-                # Firma
                 p.drawImage(QRectF(draw_x, draw_y, draw_w, draw_h), self._preview_img)
 
-                # Handles
                 handle = 8.0
                 for cx, cy in [(r.left(), r.top()), (r.right(), r.top()),
                                (r.left(), r.bottom()), (r.right(), r.bottom())]:
@@ -508,12 +549,8 @@ class PdfViewer(QWidget):
         return QPointF(pos.x() - cr.x(), pos.y() - cr.y()), cr
 
     def _hit_corner(self, pos: QPointF, r: QRectF, tol=12):
-        corners = {
-            'tl': QPointF(r.left(),  r.top()),
-            'tr': QPointF(r.right(), r.top()),
-            'bl': QPointF(r.left(),  r.bottom()),
-            'br': QPointF(r.right(), r.bottom()),
-        }
+        corners = {'tl': QPointF(r.left(),r.top()), 'tr': QPointF(r.right(),r.top()),
+                   'bl': QPointF(r.left(),r.bottom()), 'br': QPointF(r.right(),r.bottom())}
         for name, c in corners.items():
             if abs(pos.x() - c.x()) <= tol and abs(pos.y() - c.y()) <= tol:
                 return name
@@ -521,55 +558,39 @@ class PdfViewer(QWidget):
 
     def _start_sel(self, ev):
         p, cr = self._pos_local(ev.position())
-        if not QRectF(0, 0, cr.width(), cr.height()).contains(p):
-            return
-
+        if not QRectF(0, 0, cr.width(), cr.height()).contains(p): return
         if self._preview_active and self._preview_rect:
             corner = self._hit_corner(p, self._preview_rect)
             if corner:
                 self._resizing = corner; self._dragging = False; self._drag_start = p; self._orig_rect = QRectF(self._preview_rect)
             elif self._preview_rect.contains(p):
                 self._dragging = True; self._resizing = None; self._drag_start = p; self._orig_rect = QRectF(self._preview_rect)
-            self._draw_canvas()
-            return
-
-        # Selección normal
+            self._draw_canvas(); return
         self.sel_start = p; self.sel_rect = QRectF(p, p); self._draw_canvas()
 
     def _drag_sel(self, ev):
         p, _ = self._pos_local(ev.position())
         if self._preview_active and self._preview_rect:
             cr = self._target_rect()
-            pix_rect = QRectF(
-                (cr.width() - self.pm_size.width()) / 2,
-                (cr.height() - self.pm_size.height()) / 2,
-                self.pm_size.width(), self.pm_size.height()
-            )
+            pix_rect = QRectF((cr.width()-self.pm_size.width())/2, (cr.height()-self.pm_size.height())/2,
+                              self.pm_size.width(), self.pm_size.height())
             if self._dragging:
                 delta = p - self._drag_start
                 r = QRectF(self._orig_rect); r.translate(delta.x(), delta.y())
                 r = r.intersected(pix_rect)
-                self._preview_rect = r; self._draw_canvas()
-                return
+                self._preview_rect = r; self._draw_canvas(); return
             if self._resizing:
                 r = QRectF(self._orig_rect)
-                dx = p.x() - self._drag_start.x()
-                dy = p.y() - self._drag_start.y()
-                if self._resizing == 'tl':
-                    r.setTop(r.top() + dy); r.setLeft(r.left() + dx)
-                elif self._resizing == 'tr':
-                    r.setTop(r.top() + dy); r.setRight(r.right() + dx)
-                elif self._resizing == 'bl':
-                    r.setBottom(r.bottom() + dy); r.setLeft(r.left() + dx)
-                elif self._resizing == 'br':
-                    r.setBottom(r.bottom() + dy); r.setRight(r.right() + dx)
-                if r.width() < 40: r.setRight(r.left() + 40)
-                if r.height() < 20: r.setBottom(r.top() + 20)
+                dx = p.x() - self._drag_start.x(); dy = p.y() - self._drag_start.y()
+                if self._resizing == 'tl': r.setTop(r.top()+dy); r.setLeft(r.left()+dx)
+                elif self._resizing == 'tr': r.setTop(r.top()+dy); r.setRight(r.right()+dx)
+                elif self._resizing == 'bl': r.setBottom(r.bottom()+dy); r.setLeft(r.left()+dx)
+                elif self._resizing == 'br': r.setBottom(r.bottom()+dy); r.setRight(r.right()+dx)
+                if r.width() < 40: r.setRight(r.left()+40)
+                if r.height() < 20: r.setBottom(r.top()+20)
                 r = r.intersected(pix_rect)
-                self._preview_rect = r; self._draw_canvas()
-                return
+                self._preview_rect = r; self._draw_canvas(); return
 
-        # Selección normal
         if self.sel_start is None: return
         self.sel_rect = QRectF(self.sel_start, p).normalized(); self._draw_canvas()
 
@@ -579,23 +600,18 @@ class PdfViewer(QWidget):
         self._draw_canvas(); self.sel_start = None
 
     def _wheel_event(self, ev):
-        if not (self._preview_active and self._preview_rect):
-            return  # aquí podrías implementar zoom de página si quieres
+        if not (self._preview_active and self._preview_rect): return
         p, _ = self._pos_local(ev.position())
-        if not self._preview_rect.contains(p):
-            return
+        if not self._preview_rect.contains(p): return
         delta = ev.angleDelta().y()
-        factor = 1.0 + (0.0015 * delta)  # ~15% por notch
+        factor = 1.0 + (0.0015 * delta)
         r = QRectF(self._preview_rect)
         cx, cy = r.center().x(), r.center().y()
-        r.setWidth(r.width() * factor); r.setHeight(r.height() * factor)
+        r.setWidth(r.width()*factor); r.setHeight(r.height()*factor)
         r.moveCenter(QPointF(cx, cy))
         cr = self._target_rect()
-        pix_rect = QRectF(
-            (cr.width() - self.pm_size.width()) / 2,
-            (cr.height() - self.pm_size.height()) / 2,
-            self.pm_size.width(), self.pm_size.height()
-        )
+        pix_rect = QRectF((cr.width()-self.pm_size.width())/2, (cr.height()-self.pm_size.height())/2,
+                          self.pm_size.width(), self.pm_size.height())
         r = r.intersected(pix_rect)
         self._preview_rect = r; self._draw_canvas()
 
@@ -607,8 +623,8 @@ class PdfViewer(QWidget):
         r = QRectF(self.sel_rect); r.translate(-x_off, -y_off)
         r = r.intersected(QRectF(0, 0, self.pm_size.width(), self.pm_size.height()))
         if r.isEmpty(): return None
-        return (r.left() / self.render_scale, r.top() / self.render_scale,
-                r.right() / self.render_scale, r.bottom() / self.render_scale)
+        return (r.left()/self.render_scale, r.top()/self.render_scale,
+                r.right()/self.render_scale, r.bottom()/self.render_scale)
 
     def _canvas_rect_to_pdf_points(self, r: QRectF):
         cr = self._target_rect()
@@ -617,10 +633,9 @@ class PdfViewer(QWidget):
         r2 = QRectF(r); r2.translate(-x_off, -y_off)
         r2 = r2.intersected(QRectF(0, 0, self.pm_size.width(), self.pm_size.height()))
         if r2.isEmpty(): return None
-        return (r2.left() / self.render_scale, r2.top() / self.render_scale,
-                r2.right() / self.render_scale, r2.bottom() / self.render_scale)
+        return (r2.left()/self.render_scale, r2.top()/self.render_scale,
+                r2.right()/self.render_scale, r2.bottom()/self.render_scale)
 
-    # ---- Flujo de firma ----
     def sign_here(self):
         if not self.doc:
             QMessageBox.warning(self, "Firmar", "Abre un PDF primero."); return
@@ -628,35 +643,42 @@ class PdfViewer(QWidget):
         if not rect_pt:
             QMessageBox.warning(self, "Firmar", "Dibuja un rectángulo para la firma."); return
 
-        # Tamaño del lienzo del pad ~ tamaño del rect en puntos a 300 dpi
-        left, top, right, bottom = rect_pt
-        width_pt = max(1.0, right - left)
-        height_pt = max(1.0, bottom - top)
-        dpi = 300
-        width_px = int(width_pt / 72.0 * dpi)
-        height_px = int(height_pt / 72.0 * dpi)
-        width_px = max(600, min(width_px, 3000))
-        height_px = max(300, min(height_px, 2000))
+        # tamaño inicial del buffer según pantalla
+        scr = QApplication.primaryScreen()
+        if scr:
+            geo = scr.availableGeometry().size()
+            width_px  = min(4096, max(1600, int(geo.width()*1.25)))
+            height_px = min(4096, max(900,  int(geo.height()*1.25)))
+        else:
+            width_px, height_px = 2400, 1200
 
-        pad = SignaturePad(size_px=QSize(width_px, height_px), pen_width=7, parent=self, fullscreen=True)
+        pad = SignaturePad(size_px=QSize(width_px, height_px), pen_width=7, parent=None, fullscreen=True)
         if pad.exec() != QDialog.DialogCode.Accepted:
             return
         png_bytes = pad.result_png_bytes()
-        if not png_bytes:
-            return
+        if not png_bytes: return
 
-        # Cargar la imagen para preview
         img = QImage()
         if not img.loadFromData(png_bytes, "PNG"):
-            QMessageBox.critical(self, "Firma", "No se pudo leer la imagen de la firma.")
-            return
+            QMessageBox.critical(self, "Firma", "No se pudo leer la imagen de la firma."); return
+
+        # Sello “Confirmado” + fecha/hora (opcional con checkbox)
+        if self.chk_ts.isChecked():
+            ts_text = datetime.now().strftime("%d/%m/%Y %H:%M")  # 24h
+            img = add_confirmation_stamp(
+                img,
+                title_text="Confirmado",
+                dt_text=ts_text,
+                box_width_frac=0.45,  # súbelo si lo quieres más grande (p.ej., 0.55)
+                margin=24,
+                pad_in=16
+            )
 
         if not self.sel_rect or self.sel_rect.isEmpty():
-            QMessageBox.warning(self, "Firma", "Selecciona el área objetivo en la página.")
-            return
+            QMessageBox.warning(self, "Firma", "Selecciona el área objetivo en la página."); return
 
         self._preview_img = img
-        self._preview_rect = QRectF(self.sel_rect)  # inicia sobre el rect elegido
+        self._preview_rect = QRectF(self.sel_rect)
         self._preview_active = True
         self.btn_apply.setVisible(True); self.btn_cancel.setVisible(True)
         self._draw_canvas()
@@ -679,7 +701,7 @@ class PdfViewer(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Firmar", f"Error al insertar firma:\n{e}")
         finally:
-            self.cancel_signature()  # limpiar preview
+            self.cancel_signature()
 
     def cancel_signature(self):
         self._preview_active = False
@@ -688,7 +710,6 @@ class PdfViewer(QWidget):
         self.btn_apply.setVisible(False); self.btn_cancel.setVisible(False)
         self._draw_canvas()
 
-    # ---- Navegación ----
     def prev_page(self):
         if not self.doc: return
         if self.page_index > 0: self.page_index -= 1; self.render_page()
@@ -735,9 +756,7 @@ class MainWindow(QMainWindow):
     def show_help(self):
         QMessageBox.information(
             self, "Atajos",
-            "Esc: cancelar\nEnter: confirmar\nF11: pantalla completa (pad)\n"
-            "Preview: arrastra para mover, esquinas para redimensionar, rueda para zoom.\n\n"
-            "Nota: esto es una marca visual de firma (no firma digital PAdES)."
+            "ENTER: confirmar   |   ESC: cancelar   |   CTRL+L: limpiar   |   F11: fullscreen toggle"
         )
 
     def open_pdf(self):
@@ -749,7 +768,7 @@ class MainWindow(QMainWindow):
 # ---------------------------------------------------------------------
 def main():
     try:
-        import fitz  # asegurar import
+        import fitz
     except Exception as e:
         print("ERROR importando PyMuPDF (fitz):", e)
         print("Instala con: pip install pymupdf")
